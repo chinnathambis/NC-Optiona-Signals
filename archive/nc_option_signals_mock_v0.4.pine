@@ -1,0 +1,476 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════════
+//  NC Option Signals — independent recreation · MOCK v0.4 (PROVISIONAL)
+//  v0.4 (2026-10-15): SENSEX options (root BSX) → BSE:SENSEX, min premium 40; BKX → BSE:BANKEX (unverified);
+//        Spot/STATUS say "Underlying not found" instead of NaN; analysis header left-aligned.
+//  v0.3 (2026-10-15): engine + gate values plotted to the Data Window (hover any bar to see why it
+//        did or didn't signal). No rule changes.
+//  v0.2 (2026-10-15): exhaustion loosened 1.8×→2.5× session low (orig fired at ≈1.57×, R6);
+//        diagnostics show blocked-by counts over loaded history; STATUS "Signal Given — Wait for Next";
+//        Est. Delta hidden on non-option charts.
+//  Target: "NC - Option Signals" by niftyclubz (protected source, not copied).
+//  Built only from public description (R1), screenshots (R2–R4), inputs photo (R5).
+//
+//  Evidence key used in comments:
+//    [C] confirmed by evidence     [P] provisional guess — expect to change
+//
+//  WHAT IS SOLID          SL/target maths [C], pill/entry/caution layout [C],
+//                         10-min engine on completed bars [C], inputs list [C]
+//  WHAT IS GUESSED        how conditions combine into a trigger [P],
+//                         underlying confirmation [P], gate formulas + thresholds [P],
+//                         exhaustion filter [P], STATUS cut-off [P]
+//
+//  Supported charts in this mock: 10m (native) and 5m (engine via 10m request).
+//  15m and others → analysis only (proper 15m handling needs more evidence).
+// ════════════════════════════════════════════════════════════════════════════
+indicator("NC Option Signals (Mock v0.4)", shorttitle = "NC Mock v0.4", overlay = true, max_labels_count = 500, max_lines_count = 100)
+
+// ───────────────────────── Inputs (mirror R5 dialog) [C] ─────────────────────────
+modeIn    = input.string("BUYER (Option Buyer)", "Mode", options = ["BUYER (Option Buyer)", "SELLER (Option Seller)"])
+slPct     = input.float(30, "Stop Loss %", minval = 10, maxval = 90, step = 1)
+sigPillIn = input.string("Auto", "Signal Pill Placement", options = ["Auto", "Above Bar", "Below Bar"])
+entPillIn = input.string("Auto", "Entry Pill Placement", options = ["Auto", "Above Bar", "Below Bar"])
+showSL    = input.bool(true, "Show SL Line")
+showTgt   = input.bool(true, "Show Target Lines")
+showAna   = input.bool(true, "Show Analysis Section")
+showDiag  = input.bool(false, "Show Engine Diagnostics")
+anaPosIn  = input.string("Top Right", "Analysis Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
+txtSizeIn = input.string("Small", "Text Size", options = ["Tiny", "Small", "Normal"])
+themeIn   = input.string("Auto", "Theme", options = ["Auto", "Light", "Dark"])
+
+isBuyer = str.startswith(modeIn, "BUYER")
+
+// ───────────────────────── Hard-coded engine constants ─────────────────────────
+// R5 shows no engine inputs → original hard-codes these. [C]
+ENGINE_TF  = "10"     // [C] engine always on completed 10-min bars
+MACD_F     = 12       // [C]
+MACD_S     = 26       // [C]
+MACD_SIG   = 9        // [C]
+RSI_LEN    = 14       // [C]
+RSI_AVG    = 14       // [C] RSI compared with its own 14-period average
+VWMA_LEN   = 20       // [C]
+REG_BARS   = 30       // [C] 30-bar regression window
+DELTA_MIN  = 0.20     // [P] min |est. delta| (premium pts per underlying pt)
+FIT_MIN    = 0.50     // [P] min R² of premium-vs-underlying regression
+DRIFT_MAX  = 0.50     // [P] value from old dashboard "0.02 / 0.5" (R4); units assumed % of premium per engine bar
+EXH_BUY    = 2.50     // [P] buyer blocked if premium ≥ 2.5 × session low (orig allowed ≈1.57×, R6)
+EXH_SELL   = 0.35     // [P] seller blocked if premium ≤ 0.35 × session high
+MAX_BUYS   = 3        // [C] per contract per session
+MAX_SELLS  = 2        // [C] per contract per session
+CUTOFF     = 1500     // [P] HHMM after which STATUS says avoid entry ("Post - CAS" meaning unknown)
+LINE_LEN   = 40       // bars the SL/target lines extend to the right
+TZ         = "Asia/Kolkata"
+
+// Buyer targets +25/40/60/100 %, seller −25/40/60/90 % of signal premium [C]
+B_T1 = 1.25
+B_T2 = 1.40
+B_T3 = 1.60
+B_T4 = 2.00
+S_T1 = 0.75
+S_T2 = 0.60
+S_T3 = 0.40
+S_T4 = 0.10
+
+// Colours (sampled from screenshots)
+C_SIG   = #7B4DFF   // purple signal pill + signal bar
+C_ENTRY = #2A2E39   // dark entry pill
+C_WARN  = #FF9800   // orange caution tag + SL
+C_TGT   = #22C55E   // green targets
+C_HDR   = #2962FF
+C_LBL   = #363A45
+C_UP    = #00C853
+C_DN    = #F23645
+C_NEU   = #787B86
+C_VIX   = #FFD54F
+
+// ───────────────────────── Symbol parsing ─────────────────────────
+// TradingView option ticker format: ROOT + YYMMDD + C/P + STRIKE  e.g. NIFTY260901P24200
+tkr       = syminfo.ticker
+root      = str.match(tkr, "^[A-Z&-]+")
+rest      = str.substring(tkr, str.length(root))
+isOption  = root != "" and str.match(rest, "^[0-9]{6}[CP][0-9]") != ""
+isCall    = isOption and str.substring(rest, 6, 7) == "C"
+strikeTxt = isOption ? str.substring(rest, 7) : ""
+
+f_underlying(string r) =>
+    string u = switch r
+        "NIFTY"      => "NSE:NIFTY"
+        "BANKNIFTY"  => "NSE:BANKNIFTY"
+        "FINNIFTY"   => "NSE:CNXFINANCE"
+        "MIDCPNIFTY" => "NSE:NIFTY_MID_SELECT"
+        "SENSEX"     => "BSE:SENSEX"
+        "BSX"        => "BSE:SENSEX"   // TradingView SENSEX option root (verified 15 Oct, BSX261015C73300)
+        "BKX"        => "BSE:BANKEX"   // [P] assumed BANKEX option root — unverified
+        "BANKEX"     => "BSE:BANKEX"
+        =>              syminfo.prefix == "MCX" ? "MCX:" + r + "1!" : syminfo.prefix + ":" + r
+    u
+
+f_minPrem(string r) =>   // [C] exists for NIFTY/BANKNIFTY/SENSEX seller sells; [P] values
+    switch r
+        "NIFTY"     => 15.0
+        "BANKNIFTY" => 40.0
+        "SENSEX"    => 40.0
+        "BSX"       => 40.0
+        =>             0.0
+
+uId      = isOption ? f_underlying(root) : syminfo.tickerid
+uName    = not isOption ? syminfo.ticker : root == "BSX" ? "SENSEX" : root == "BKX" ? "BANKEX" : root
+minPrem  = f_minPrem(root)
+
+is10 = timeframe.period == "10"
+is5  = timeframe.period == "5"
+tfOK = is10 or is5
+
+// ───────────────────────── Engine series ─────────────────────────
+f_contract(int o) =>
+    [m, s, h] = ta.macd(close, MACD_F, MACD_S, MACD_SIG)
+    r  = ta.rsi(close, RSI_LEN)
+    ra = ta.sma(r, RSI_AVG)
+    vw = ta.vwma(close, VWMA_LEN)
+    [close[o], m[o], s[o], r[o], ra[o], vw[o], time[o], time_close[o]]
+
+f_under(int o) =>
+    [m, s, h] = ta.macd(close, MACD_F, MACD_S, MACD_SIG)
+    [close[o], h[o]]
+
+f_uHist(int o) =>
+    [m, s, h] = ta.macd(close, MACD_F, MACD_S, MACD_SIG)
+    h[o]
+
+f_trend(int o) =>
+    [m, s, h] = ta.macd(close, MACD_F, MACD_S, MACD_SIG)
+    r  = ta.rsi(close, RSI_LEN)
+    ra = ta.sma(r, RSI_AVG)
+    [h[o], r[o], ra[o]]
+
+// 10m chart → native values, signals gated to bar close.
+// 5m chart  → previous COMPLETED 10m bar via [1] + lookahead_on (no repaint, appears at 10m close).
+[nC, nM, nS, nR, nRA, nVW, nT, nTC] = f_contract(0)
+[sC, sM, sS, sR, sRA, sVW, sT, sTC] = request.security(syminfo.tickerid, ENGINE_TF, f_contract(1), lookahead = barmerge.lookahead_on)
+eC  = is10 ? nC  : sC
+eM  = is10 ? nM  : sM
+eS  = is10 ? nS  : sS
+eR  = is10 ? nR  : sR
+eRA = is10 ? nRA : sRA
+eVW = is10 ? nVW : sVW
+eT  = is10 ? nT  : sT
+eTC = is10 ? nTC : sTC
+
+[uCn, uHn] = request.security(uId, ENGINE_TF, f_under(0), ignore_invalid_symbol = true)
+[uCs, uHs] = request.security(uId, ENGINE_TF, f_under(1), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+uC  = is10 ? uCn : uCs
+uH  = is10 ? uHn : uHs
+// [P] "slower" seller confirmation → 15m underlying MACD histogram (last completed 15m bar)
+uH15 = request.security(uId, "15", f_uHist(1), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+// Dashboard trend: 30m MACD + RSI [C]
+[t30H, t30R, t30RA] = request.security(uId, "30", f_trend(1), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+
+spotNow  = request.security(uId, timeframe.period, close, ignore_invalid_symbol = true)
+spotPrev = request.security(uId, "D", close[1], lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+vixNow   = request.security("NSE:INDIAVIX", timeframe.period, close, ignore_invalid_symbol = true)
+vixPrev  = request.security("NSE:INDIAVIX", "D", close[1], lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+
+engNew  = is10 ? true : sT != sT[1]
+engConf = is10 ? barstate.isconfirmed : true
+engStep = isOption and tfOK and engNew and engConf and not na(eC)
+
+// ───────────────────────── Strike-quality gates [P] ─────────────────────────
+// Hypothesis: regress premium on underlying over 30 engine bars.
+//   Est. delta   = OLS slope (premium pts per underlying pt)
+//   Fit          = R²
+//   Adverse drift= premium change NOT explained by the underlying, % of premium per engine bar,
+//                  counted only in the direction that hurts the trade (decay for buyer, rise for seller)
+tfMin   = timeframe.in_seconds() / 60.0
+regWin  = math.max(2, math.round(REG_BARS * 10 / tfMin))   // 30 on 10m, 60 on 5m (duplicates don't change OLS)
+corrPU  = ta.correlation(eC, uC, regWin)
+sdP     = ta.stdev(eC, regWin)
+sdU     = ta.stdev(uC, regWin)
+estDelta = isOption and sdU > 0 ? corrPU * sdP / sdU : na
+fitR2    = corrPU * corrPU
+residChg = (eC - eC[regWin]) - estDelta * (uC - uC[regWin])
+driftPct = eC > 0 ? residChg / REG_BARS / eC * 100 : na
+advBuy   = math.max(0, -driftPct)
+advSell  = math.max(0, driftPct)
+
+deltaOK     = math.abs(estDelta) >= DELTA_MIN
+fitOK       = fitR2 >= FIT_MIN
+buyDriftOK  = advBuy <= DRIFT_MAX
+sellDriftOK = advSell <= DRIFT_MAX
+buyGates    = deltaOK and fitOK and buyDriftOK
+sellGates   = deltaOK and fitOK and sellDriftOK
+
+// ───────────────────────── Contract momentum [C ingredients, P combination] ─────────────────────────
+momUp = eM > eS
+rsiUp = eR > eRA
+abvVW = eC > eVW
+momDn = eM < eS
+rsiDn = eR < eRA
+blwVW = eC < eVW
+
+// Underlying confirmation, direction-aware by option type [P]
+buyConfirm  = isCall ? uH > 0 : uH < 0       // buying CE needs bullish underlying, PE bearish
+sellConfirm = isCall ? uH15 < 0 : uH15 > 0   // selling CE needs bearish underlying, PE bullish (slower TF)
+
+// ───────────────────────── Session state ─────────────────────────
+engDay    = dayofmonth(eT, TZ)
+newEngDay = engDay != engDay[1]
+
+var float sessHi      = na
+var float sessLo      = na
+var int   buysToday   = 0
+var int   sellsToday  = 0
+var bool  prevBuyFull = false
+var bool  prevSellFull = false
+
+if engStep
+    if newEngDay
+        sessHi     := eC
+        sessLo     := eC
+        buysToday  := 0
+        sellsToday := 0
+    else
+        sessHi := math.max(nz(sessHi, eC), eC)
+        sessLo := math.min(nz(sessLo, eC), eC)
+
+exhBuy     = not na(sessLo) and eC >= sessLo * EXH_BUY     // [P]
+exhSell    = not na(sessHi) and eC <= sessHi * EXH_SELL    // [P]
+sellPremOK = eC >= minPrem
+
+// Trigger hypothesis H1 [P]: signal on the FIRST engine bar where everything lines up
+// (MACD, RSI vs avg, close vs VWMA, underlying, gates, exhaustion) after it did not.
+buyFull  = momUp and rsiUp and abvVW and buyConfirm and buyGates and not exhBuy
+sellFull = momDn and rsiDn and blwVW and sellConfirm and sellGates and not exhSell and sellPremOK
+
+buySig  = engStep and buyFull and not prevBuyFull and buysToday < MAX_BUYS
+sellSig = engStep and sellFull and not prevSellFull and sellsToday < MAX_SELLS
+
+// ── Blocked-by counters over all loaded history (diagnostic only) ──
+// index: 0 setup bars, 1 underlying, 2 delta, 3 fit, 4 drift, 5 exhaustion, 6 cap, 7 min premium, 8 signals
+var array<int> cntB = array.new<int>(9, 0)
+var array<int> cntS = array.new<int>(9, 0)
+
+f_inc(array<int> a, int i, bool cond) =>
+    if cond
+        array.set(a, i, array.get(a, i) + 1)
+
+setupB = momUp and rsiUp and abvVW
+setupS = momDn and rsiDn and blwVW
+if engStep and setupB
+    f_inc(cntB, 0, true)
+    f_inc(cntB, 1, not buyConfirm)
+    f_inc(cntB, 2, not deltaOK)
+    f_inc(cntB, 3, not fitOK)
+    f_inc(cntB, 4, not buyDriftOK)
+    f_inc(cntB, 5, exhBuy)
+    f_inc(cntB, 6, buyFull and not prevBuyFull and buysToday >= MAX_BUYS)
+if engStep and setupS
+    f_inc(cntS, 0, true)
+    f_inc(cntS, 1, not sellConfirm)
+    f_inc(cntS, 2, not deltaOK)
+    f_inc(cntS, 3, not fitOK)
+    f_inc(cntS, 4, not sellDriftOK)
+    f_inc(cntS, 5, exhSell)
+    f_inc(cntS, 6, sellFull and not prevSellFull and sellsToday >= MAX_SELLS)
+    f_inc(cntS, 7, not sellPremOK)
+f_inc(cntB, 8, buySig)
+f_inc(cntS, 8, sellSig)
+
+if engStep
+    prevBuyFull  := buyFull
+    prevSellFull := sellFull
+if buySig
+    buysToday += 1
+if sellSig
+    sellsToday += 1
+
+// ───────────────────────── Visual helpers ─────────────────────────
+sz = switch txtSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    =>          size.small
+
+bgLum  = 0.299 * color.r(chart.bg_color) + 0.587 * color.g(chart.bg_color) + 0.114 * color.b(chart.bg_color)
+isDark = themeIn == "Dark" or (themeIn == "Auto" and bgLum < 128)
+
+f_above(string pref, bool isBuy) =>
+    pref == "Above Bar" ? true : pref == "Below Bar" ? false : not isBuy
+
+f_ord(int n) =>
+    n == 2 ? "2nd" : n == 3 ? "3rd" : str.tostring(n) + "th"
+
+f_fmt(float v) =>
+    str.tostring(v, v < 20 ? "#.#" : "#")
+
+f_level(array<line> ls, array<label> lbs, float y, string tag, color c, int x1, int x2, string tsz) =>
+    array.push(ls, line.new(x1, y, x2, y, color = c, width = 1))
+    array.push(lbs, label.new(x2, y, f_fmt(y) + " " + tag, style = label.style_label_left, color = c, textcolor = color.white, size = tsz))
+
+// ───────────────────────── Chart drawing ─────────────────────────
+showBuySig  = buySig and isBuyer
+showSellSig = sellSig and not isBuyer
+
+var array<line>  lvlLines  = array.new<line>()
+var array<label> lvlLabels = array.new<label>()
+var int pendingEntry = 0     // 1 buy, -1 sell → Entry pill on the NEXT bar [C]
+var int lastSigBar   = na
+
+if pendingEntry != 0
+    bool eab = f_above(entPillIn, pendingEntry == 1)
+    label.new(bar_index, eab ? high : low, "Entry", yloc = eab ? yloc.abovebar : yloc.belowbar, style = eab ? label.style_label_down : label.style_label_up, color = C_ENTRY, textcolor = color.white, size = sz)
+    pendingEntry := 0
+
+if showBuySig or showSellSig
+    bool  isB = showBuySig
+    int   n   = isB ? buysToday : sellsToday
+    float P   = eC                                   // premium at signal = signal-bar close [C]
+    bool  ab  = f_above(sigPillIn, isB)
+    // Pill shows the 10m bar CLOSE time [C]
+    label.new(bar_index, ab ? high : low, str.format_time(eTC, "hh:mm a", TZ) + "\n" + (isB ? "Buy Signal" : "Sell Signal"), yloc = ab ? yloc.abovebar : yloc.belowbar, style = ab ? label.style_label_down : label.style_label_up, color = C_SIG, textcolor = color.white, size = sz)
+    if n >= 2   // repeat tag from 2nd signal of the day, opposite side [C]
+        label.new(bar_index, ab ? low : high, f_ord(n) + " Signal - Be Cautious", yloc = ab ? yloc.belowbar : yloc.abovebar, style = ab ? label.style_label_up : label.style_label_down, color = C_WARN, textcolor = color.white, size = sz)
+    for l in lvlLines
+        line.delete(l)
+    for lb in lvlLabels
+        label.delete(lb)
+    array.clear(lvlLines)
+    array.clear(lvlLabels)
+    int x2 = bar_index + LINE_LEN
+    if showSL
+        f_level(lvlLines, lvlLabels, isB ? P * (1 - slPct / 100) : P * (1 + slPct / 100), "SL", C_WARN, bar_index, x2, sz)
+    if showTgt
+        f_level(lvlLines, lvlLabels, P * (isB ? B_T1 : S_T1), "T1", C_TGT, bar_index, x2, sz)
+        f_level(lvlLines, lvlLabels, P * (isB ? B_T2 : S_T2), "T2", C_TGT, bar_index, x2, sz)
+        f_level(lvlLines, lvlLabels, P * (isB ? B_T3 : S_T3), "T3", C_TGT, bar_index, x2, sz)
+        f_level(lvlLines, lvlLabels, P * (isB ? B_T4 : S_T4), "T4", C_TGT, bar_index, x2, sz)
+    pendingEntry := isB ? 1 : -1
+    lastSigBar   := bar_index
+
+barcolor(showBuySig or showSellSig ? C_SIG : na)
+
+// Background: light = MACD or RSI holds, dark = both [C pattern, P exact shades]
+bool engOn = isOption and tfOK
+color bgBuy  = momUp and rsiUp ? color.new(C_UP, 84) : (momUp or rsiUp) ? color.new(C_UP, 94) : na
+color bgSell = momDn and rsiDn ? color.new(C_DN, 84) : (momDn or rsiDn) ? color.new(C_DN, 94) : na
+bgcolor(engOn ? (isBuyer ? bgBuy : bgSell) : na)
+
+// ───────────────────────── Alerts (fire regardless of Mode) [C] ─────────────────────────
+plot(buySig ? eC : na, "Buy Premium", display = display.data_window)
+plot(buySig ? eC * (1 - slPct / 100) : na, "Buy SL", display = display.data_window)
+plot(buySig ? eC * B_T1 : na, "Buy T1", display = display.data_window)
+plot(buySig ? eC * B_T2 : na, "Buy T2", display = display.data_window)
+plot(buySig ? eC * B_T3 : na, "Buy T3", display = display.data_window)
+plot(buySig ? eC * B_T4 : na, "Buy T4", display = display.data_window)
+plot(sellSig ? eC : na, "Sell Premium", display = display.data_window)
+plot(sellSig ? eC * (1 + slPct / 100) : na, "Sell SL", display = display.data_window)
+plot(sellSig ? eC * S_T1 : na, "Sell T1", display = display.data_window)
+plot(sellSig ? eC * S_T2 : na, "Sell T2", display = display.data_window)
+plot(sellSig ? eC * S_T3 : na, "Sell T3", display = display.data_window)
+plot(sellSig ? eC * S_T4 : na, "Sell T4", display = display.data_window)
+
+// ───────────────────────── Data Window inspection (v0.3) ─────────────────────────
+// Hover any bar with the Data Window open. Flags: 1 = pass / true, 0 = fail / false.
+// Values are the engine's 10m bar (on 5m charts: the last COMPLETED 10m bar).
+bool dwOn   = isOption and tfOK
+bool mSetup = isBuyer ? setupB : setupS
+bool mUnd   = isBuyer ? buyConfirm : sellConfirm
+bool mDrift = isBuyer ? buyDriftOK : sellDriftOK
+bool mExh   = isBuyer ? not exhBuy : not exhSell
+float exhRatio = isBuyer ? (sessLo > 0 ? eC / sessLo : na) : (sessHi > 0 ? eC / sessHi : na)
+plot(dwOn ? (mSetup ? 1 : 0) : na, "DW Setup (MACD+RSI+VWMA)", display = display.data_window)
+plot(dwOn ? (mUnd ? 1 : 0) : na, "DW Underlying OK", display = display.data_window)
+plot(dwOn ? (deltaOK ? 1 : 0) : na, "DW Delta OK", display = display.data_window)
+plot(dwOn ? (fitOK ? 1 : 0) : na, "DW Fit OK", display = display.data_window)
+plot(dwOn ? (mDrift ? 1 : 0) : na, "DW Drift OK", display = display.data_window)
+plot(dwOn ? (mExh ? 1 : 0) : na, "DW Exhaustion OK", display = display.data_window)
+plot(dwOn ? estDelta : na, "DW Est Delta", display = display.data_window)
+plot(dwOn ? fitR2 : na, "DW Fit R2", display = display.data_window)
+plot(dwOn ? (isBuyer ? advBuy : advSell) : na, "DW Adverse Drift %", display = display.data_window)
+plot(dwOn ? exhRatio : na, "DW Premium / session low(buy) or high(sell)", display = display.data_window)
+plot(dwOn ? eM - eS : na, "DW MACD - signal", display = display.data_window)
+plot(dwOn ? eR - eRA : na, "DW RSI - avg", display = display.data_window)
+plot(dwOn ? eC - eVW : na, "DW Close - VWMA", display = display.data_window)
+plot(dwOn ? uH : na, "DW Under 10m MACD hist", display = display.data_window)
+plot(dwOn ? uH15 : na, "DW Under 15m MACD hist", display = display.data_window)
+
+alertcondition(buySig, "Buy Signal", 'NC BUY {{ticker}} | Premium {{plot("Buy Premium")}} | SL {{plot("Buy SL")}} | T1 {{plot("Buy T1")}} | T2 {{plot("Buy T2")}} | T3 {{plot("Buy T3")}} | T4 {{plot("Buy T4")}} | {{time}}')
+alertcondition(sellSig, "Sell Signal", 'NC SELL {{ticker}} | Premium {{plot("Sell Premium")}} | SL {{plot("Sell SL")}} | T1 {{plot("Sell T1")}} | T2 {{plot("Sell T2")}} | T3 {{plot("Sell T3")}} | T4 {{plot("Sell T4")}} | {{time}}')
+
+// ───────────────────────── Analysis dashboard [C layout from R2/R3] ─────────────────────────
+f_pos(string p) =>
+    switch p
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        =>                position.top_right
+
+var table ana  = table.new(f_pos(anaPosIn), 3, 6, border_width = 1, border_color = color.new(color.gray, 70))
+var table diag = table.new(anaPosIn == "Bottom Right" ? position.bottom_left : position.bottom_right, 2, 20, border_width = 1, border_color = color.new(color.gray, 70))
+
+if barstate.isfirst
+    table.merge_cells(ana, 0, 0, 2, 0)
+    for r = 1 to 5
+        if r != 3
+            table.merge_cells(ana, 1, r, 2, r)
+
+f_arrow(float v) =>
+    v >= 0 ? "▲" : "▼"
+
+qDrift  = isBuyer ? buyDriftOK : sellDriftOK
+qPass   = (deltaOK ? 1 : 0) + (fitOK ? 1 : 0) + (qDrift ? 1 : 0)
+strikeQ = not isOption ? "—" : na(estDelta) ? "Calculating" : qPass == 3 ? "Good" : qPass == 2 ? "Fair" : "Poor"
+t30Bull = t30H > 0 and t30R > t30RA
+t30Bear = t30H < 0 and t30R < t30RA
+hhmm    = hour(time, TZ) * 100 + minute(time, TZ)
+
+if barstate.islast and showAna
+    txtN  = color.white
+    vixCh = vixPrev > 0 ? (vixNow - vixPrev) / vixPrev * 100 : na
+    spCh  = spotPrev > 0 ? (spotNow - spotPrev) / spotPrev * 100 : na
+    bool uMissing = isOption and na(spotNow)
+    status = not isOption ? "Analysis Only" : uMissing ? "Underlying Not Found" : not tfOK ? "Use 5m / 10m chart" : hhmm >= CUTOFF ? "Post 3PM — Avoid Entry" : (isBuyer ? buysToday : sellsToday) > 0 ? "Signal Given — Wait for Next" : strikeQ != "Good" ? "Strike Not Suitable" : "Watching"
+    // Left-aligned so TradingView's hover buttons (top-right of the table) don't cover the text
+    table.cell(ana, 0, 0, "ANALYSIS - OPTION " + (isBuyer ? "BUYER" : "SELLER"), bgcolor = C_HDR, text_color = txtN, text_size = sz, text_halign = text.align_left)
+    table.cell(ana, 0, 1, "INDIA VIX", bgcolor = C_LBL, text_color = txtN, text_size = sz)
+    table.cell(ana, 1, 1, str.tostring(vixNow, "#.##") + "  " + f_arrow(vixCh) + " " + str.tostring(vixCh, "#.##") + "%", bgcolor = C_VIX, text_color = color.black, text_size = sz)
+    table.cell(ana, 0, 2, "SPOT", bgcolor = C_LBL, text_color = txtN, text_size = sz)
+    if uMissing
+        table.cell(ana, 1, 2, "Underlying not found: " + uId, bgcolor = C_NEU, text_color = txtN, text_size = sz)
+    else
+        table.cell(ana, 1, 2, uName + " " + str.tostring(spotNow, "#.##") + "  " + f_arrow(spCh) + " " + str.tostring(spCh, "#.##") + "%", bgcolor = spCh >= 0 ? C_UP : C_DN, text_color = txtN, text_size = sz)
+    table.cell(ana, 0, 3, "TREND", bgcolor = C_LBL, text_color = txtN, text_size = sz)
+    table.cell(ana, 1, 3, "30 min " + (t30Bull ? "▲ Bullish" : t30Bear ? "▼ Bearish" : "• Neutral"), bgcolor = t30Bull ? C_UP : t30Bear ? C_DN : C_NEU, text_color = txtN, text_size = sz)
+    table.cell(ana, 2, 3, "10 min " + (uH > 0 ? "▲" : "▼"), bgcolor = uH > 0 ? C_UP : C_DN, text_color = txtN, text_size = sz)
+    table.cell(ana, 0, 4, "Strike Quality", bgcolor = C_LBL, text_color = txtN, text_size = sz)
+    table.cell(ana, 1, 4, strikeQ, bgcolor = strikeQ == "Good" ? C_UP : strikeQ == "Fair" ? C_WARN : strikeQ == "Poor" ? C_DN : C_NEU, text_color = txtN, text_size = sz)
+    table.cell(ana, 0, 5, "STATUS", bgcolor = C_LBL, text_color = txtN, text_size = sz)
+    table.cell(ana, 1, 5, status, bgcolor = C_LBL, text_color = txtN, text_size = sz)
+
+// ───────────────────────── Engine diagnostics (for testing hypotheses) ─────────────────────────
+f_drow(table t, int r, string k, string v, bool ok, bool dark) =>
+    color bg = dark ? #1E222D : #F0F3FA
+    color tx = dark ? color.white : color.black
+    table.cell(t, 0, r, k, bgcolor = bg, text_color = tx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, r, v, bgcolor = ok ? color.new(C_UP, 70) : color.new(C_DN, 70), text_color = tx, text_size = size.tiny, text_halign = text.align_left)
+
+if barstate.islast and showDiag
+    f_drow(diag, 0, "MOCK v0.4", "provisional rules", true, isDark)
+    f_drow(diag, 1, "Engine", is10 ? "10m native" : is5 ? "10m via 5m (on 10m close)" : "inactive on this TF", tfOK, isDark)
+    f_drow(diag, 2, "Contract", isOption ? (isCall ? "CE " : "PE ") + strikeTxt + " → " + uId : "not an option", isOption, isDark)
+    f_drow(diag, 3, "MACD vs signal", momUp ? "▲ above" : "▼ below", isBuyer ? momUp : momDn, isDark)
+    f_drow(diag, 4, "RSI / 14-avg", str.tostring(eR, "#.0") + " / " + str.tostring(eRA, "#.0"), isBuyer ? rsiUp : rsiDn, isDark)
+    f_drow(diag, 5, "Close / VWMA20", str.tostring(eC, "#.##") + " / " + str.tostring(eVW, "#.##"), isBuyer ? abvVW : blwVW, isDark)
+    f_drow(diag, 6, "Under 10m MACD hist", str.tostring(uH, "#.##"), buyConfirm, isDark)
+    f_drow(diag, 7, "Under 15m MACD hist", str.tostring(uH15, "#.##"), sellConfirm, isDark)
+    f_drow(diag, 8, "Est. Delta (min)", str.tostring(estDelta, "#.##") + " (" + str.tostring(DELTA_MIN) + ")", deltaOK, isDark)
+    f_drow(diag, 9, "Fit R² (min)", str.tostring(fitR2, "#.##") + " (" + str.tostring(FIT_MIN) + ")", fitOK, isDark)
+    f_drow(diag, 10, "Adverse Drift / max", str.tostring(isBuyer ? advBuy : advSell, "#.##") + " / " + str.tostring(DRIFT_MAX), qDrift, isDark)
+    f_drow(diag, 11, "Exhaustion", (isBuyer ? exhBuy : exhSell) ? "BLOCKED" : "ok", not (isBuyer ? exhBuy : exhSell), isDark)
+    f_drow(diag, 12, "Min premium (sell)", str.tostring(minPrem), sellPremOK, isDark)
+    f_drow(diag, 13, "Signals today", "Buy " + str.tostring(buysToday) + "/" + str.tostring(MAX_BUYS) + " · Sell " + str.tostring(sellsToday) + "/" + str.tostring(MAX_SELLS), true, isDark)
+    f_drow(diag, 14, "Buy setup", buyFull ? "ALL TRUE" : "not aligned", buyFull, isDark)
+    f_drow(diag, 15, "Sell setup", sellFull ? "ALL TRUE" : "not aligned", sellFull, isDark)
+    array<int> cA = isBuyer ? cntB : cntS
+    f_drow(diag, 16, "History: setup bars", str.tostring(array.get(cA, 0)) + " → signals " + str.tostring(array.get(cA, 8)), array.get(cA, 8) > 0, isDark)
+    f_drow(diag, 17, "Blocked: underlying", str.tostring(array.get(cA, 1)), true, isDark)
+    f_drow(diag, 18, "Blocked: Δ · fit · drift", str.tostring(array.get(cA, 2)) + " · " + str.tostring(array.get(cA, 3)) + " · " + str.tostring(array.get(cA, 4)), true, isDark)
+    f_drow(diag, 19, "Blocked: exh · cap · prem", str.tostring(array.get(cA, 5)) + " · " + str.tostring(array.get(cA, 6)) + " · " + (isBuyer ? "–" : str.tostring(array.get(cA, 7))), true, isDark)

@@ -1,0 +1,821 @@
+//@version=6
+// ════════════════════════════════════════════════════════════════════════════
+//  NC Option Signals — independent recreation · v0.10 (PROVISIONAL)
+//  v0.10 (2026-10-15): renamed from "NC Mock" to "NC Option Signals" (display name only; logic = v0.9).
+//  v0.9 (2026-10-15) B — realism in OUTCOMES (beyond original, measurement only; signals unchanged):
+//        trades scored from the ACTUAL entry (next bar open) and net of costs (brokerage per order,
+//        slippage per side, taxes/charges % of turnover; lot size auto for index options).
+//  v0.8 (2026-10-15): trail reminder label moved to the opposite side (no overlap with T✓ markers);
+//        OUTCOMES adds win rate (% of closed trades with a positive result) and median result.
+//  Target: "NC - Option Signals" by niftyclubz (protected source, not copied).
+//  v0.7 (2026-10-15) SPEC REALIGNMENT to the author's full public description (R1b):
+//    S1 momentum PERSISTENCE trigger · S2 one signal per momentum run + cooldown · S3 seller has no VWMA rule
+//    S4 regression on bar-to-bar CHANGES (gap + post-15:15 pairs excluded), drift normalised
+//    S5 delta BAND · S6 no NSE/BSE signals after 15:15 · S7 SENSEX/BANKEX direction check reads NIFTY
+//    S8 30-bar warm-up · S9 exhaustion LATCH · S10 author's status/quality wording + colours
+//    S11 levels run 150 min · S12 repeat tag: latest only, clears after 2 sessions · S13 trail reminder
+//    S14 seven "Alert Data:" plots · S15 15m chart support
+//  Kept from v0.6 (NOT in the original): outcome tracking + OUTCOMES table (toggle).
+//
+//  Evidence key:  [C] confirmed by author/screenshots   [P] provisional number/guess
+//  All numeric thresholds below are [P] — the author does not publish them.
+// ════════════════════════════════════════════════════════════════════════════
+indicator("NC Option Signals", shorttitle = "NC Option Signals", overlay = true, max_labels_count = 500, max_lines_count = 200)
+
+// ───────────────────────── Inputs [C] (R5 + trail reminder from release notes) ─────────────────────────
+modeIn    = input.string("BUYER (Option Buyer)", "Mode", options = ["BUYER (Option Buyer)", "SELLER (Option Seller)"])
+slPct     = input.float(30, "Stop Loss %", minval = 10, maxval = 90, step = 1)
+sigPillIn = input.string("Auto", "Signal Pill Placement", options = ["Auto", "Above Bar", "Below Bar"])
+entPillIn = input.string("Auto", "Entry Pill Placement", options = ["Auto", "Above Bar", "Below Bar"])
+showSL    = input.bool(true, "Show SL Line")
+showTgt   = input.bool(true, "Show Target Lines")
+trailOn   = input.bool(true, "Trail Reminder", tooltip = "Visual only: once price reaches T1 the SL line moves to the signal premium, changes colour and shows a reminder. Alerts keep the original stop.")
+showAna   = input.bool(true, "Show Analysis Section")
+showDiag  = input.bool(false, "Show Engine Diagnostics")
+anaPosIn  = input.string("Top Right", "Analysis Position", options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"])
+txtSizeIn = input.string("Small", "Text Size", options = ["Tiny", "Small", "Normal"])
+themeIn   = input.string("Auto", "Theme", options = ["Auto", "Light", "Dark"])
+G_B       = "Beyond original (not in NC)"
+trackOn   = input.bool(true, "Track Signal Outcomes", group = G_B, tooltip = "Marks T1–T4, SL or 15:15 exit after each signal and shows hit rates. Does not change signals.")
+entryOn   = input.bool(true, "Score from actual entry (next bar open)", group = G_B, tooltip = "On: result is measured from the open of the bar after the signal (where you could actually enter). Off: from the signal premium. Levels stay at the signal premium either way.")
+lotIn     = input.int(0, "Lot size (0 = auto)", minval = 0, group = G_B, tooltip = "Auto: NIFTY 65, BANKNIFTY 30, FINNIFTY 60, MIDCPNIFTY 120, SENSEX 20 (2026 sizes). Set it yourself for stock / MCX / BANKEX options.")
+brkOrd    = input.float(20, "Brokerage per order (₹)", minval = 0, group = G_B)
+slipU     = input.float(0.25, "Slippage per side (₹ per unit)", minval = 0, step = 0.05, group = G_B)
+chgPct    = input.float(0.15, "Taxes & exchange charges (% of turnover)", minval = 0, step = 0.01, group = G_B, tooltip = "Rough total of STT, exchange fees, GST, stamp duty and SEBI fees on buy + sell value.")
+
+isBuyer = str.startswith(modeIn, "BUYER")
+
+// ───────────────────────── Engine constants ─────────────────────────
+ENGINE_TF  = "10"     // [C]
+MACD_F     = 12       // [C]
+MACD_S     = 26       // [C]
+MACD_SIG   = 9        // [C]
+RSI_LEN    = 14       // [C]
+RSI_AVG    = 14       // [C]
+VWMA_LEN   = 20       // [C]
+REG_BARS   = 30       // [C] 30 completed 10m bar-pairs
+DELTA_LO   = 0.05     // [P] delta band floor
+DELTA_HI   = 1.20     // [P] delta band ceiling (above = "not credible")
+FIT_MIN    = 0.30     // [P] min R² of Δpremium vs Δunderlying
+DRIFT_MAX  = 0.50     // [P] ceiling for normalised adverse drift (old dashboard showed "/ 0.5")
+PERSIST_B  = 2        // [P] buyer: MACD above signal for ≥2 bars ("beyond the first bar")
+PERSIST_S  = 3        // [P] seller needs more persistence [C], value [P]
+PERSIST_MCX = 1       // [P] MCX needs more again [C], extra bars [P]
+COOLDOWN   = 3        // [P] engine bars (30 min) since the last signal of the same side
+EXH_B_ON   = 80.0     // [P] buyer exhaustion: RSI ≥ 80 suspends buys …
+EXH_B_OFF  = 60.0     // [P] … until RSI retraces to ≤ 60
+EXH_S_ON   = 20.0     // [P] seller exhaustion: RSI ≤ 20 suspends sells …
+EXH_S_OFF  = 40.0     // [P] … until RSI retraces to ≥ 40
+MAX_BUYS   = 3        // [C]
+MAX_SELLS  = 2        // [C]
+CUT_SIG    = 1515     // [C] NSE/BSE: no signals after 3:15 PM
+CAS_END    = 1535     // [C] closing auction 3:15–3:35
+LEVEL_MIN  = 150      // [C] levels run 150 minutes
+EXIT_HHMM  = 1515     // outcome tracking time exit (beyond original)
+TZ         = "Asia/Kolkata"
+
+B_T1 = 1.25
+B_T2 = 1.40
+B_T3 = 1.60
+B_T4 = 2.00
+S_T1 = 0.75
+S_T2 = 0.60
+S_T3 = 0.40
+S_T4 = 0.10
+
+C_SIG   = #7B4DFF
+C_ENTRY = #2A2E39
+C_WARN  = #FF9800
+C_TGT   = #22C55E
+C_HDR   = #2962FF
+C_LBL   = #363A45
+C_UP    = #00C853
+C_DN    = #F23645
+C_NEU   = #787B86
+C_VIX   = #FFD54F
+C_TEAL  = #00897B
+C_BLUE  = #1E88E5
+
+// ───────────────────────── Symbol parsing ─────────────────────────
+tkr       = syminfo.ticker
+root      = str.match(tkr, "^[A-Z&-]+")
+rest      = str.substring(tkr, str.length(root))
+isOption  = root != "" and str.match(rest, "^[0-9]{6}[CP][0-9]") != ""
+isCall    = isOption and str.substring(rest, 6, 7) == "C"
+strikeTxt = isOption ? str.substring(rest, 7) : ""
+isMCX     = str.startswith(syminfo.prefix, "MCX")
+isBSEIdx  = root == "BSX" or root == "SENSEX" or root == "BKX" or root == "BANKEX"
+
+f_underlying(string r) =>
+    string u = switch r
+        "NIFTY"      => "NSE:NIFTY"
+        "BANKNIFTY"  => "NSE:BANKNIFTY"
+        "FINNIFTY"   => "NSE:CNXFINANCE"
+        "MIDCPNIFTY" => "NSE:NIFTY_MID_SELECT"
+        "SENSEX"     => "BSE:SENSEX"
+        "BSX"        => "BSE:SENSEX"
+        "BKX"        => "BSE:BANKEX"   // [P] BANKEX option root unverified
+        "BANKEX"     => "BSE:BANKEX"
+        =>              str.startswith(syminfo.prefix, "MCX") ? "MCX:" + r + "1!" : syminfo.prefix + ":" + r
+    u
+
+f_minPrem(string r) =>   // [C] rule exists; [P] values
+    switch r
+        "NIFTY"     => 15.0
+        "BANKNIFTY" => 40.0
+        "SENSEX"    => 40.0
+        "BSX"       => 40.0
+        =>             0.0
+
+uId     = isOption ? f_underlying(root) : syminfo.tickerid
+dirId   = isBSEIdx ? "NSE:NIFTY" : uId          // [C] S7: BSE direction check reads NIFTY
+uName   = not isOption ? syminfo.ticker : root == "BSX" ? "SENSEX" : root == "BKX" ? "BANKEX" : root
+minPrem = f_minPrem(root)
+autoLot = switch root
+    "NIFTY"      => 65
+    "BANKNIFTY"  => 30
+    "FINNIFTY"   => 60
+    "MIDCPNIFTY" => 120
+    "SENSEX"     => 20
+    "BSX"        => 20
+    =>              0
+lotUsed = lotIn > 0 ? lotIn : autoLot
+// Round-trip cost per unit (₹) for a trade entered at e and exited at x
+f_cost(float e, float x) =>
+    float brk = lotUsed > 0 ? 2 * brkOrd / lotUsed : 0.0
+    brk + 2 * slipU + chgPct / 100 * (e + x)
+
+tfMin = timeframe.in_seconds() / 60.0
+is5   = timeframe.period == "5"
+is10  = timeframe.period == "10"
+is15  = timeframe.period == "15"
+tfOK  = is5 or is10 or is15
+
+// ───────────────────────── Engine (runs inside the 10-minute context) ─────────────────────────
+f_uHist(int o) =>
+    [m, s, h] = ta.macd(close, MACD_F, MACD_S, MACD_SIG)
+    h[o]
+
+f_engine(int o) =>
+    [m, s, h] = ta.macd(close, MACD_F, MACD_S, MACD_SIG)
+    r   = ta.rsi(close, RSI_LEN)
+    ra  = ta.sma(r, RSI_AVG)
+    vw  = ta.vwma(close, VWMA_LEN)
+    uc  = request.security(uId, ENGINE_TF, close, ignore_invalid_symbol = true)
+    d10 = request.security(dirId, ENGINE_TF, f_uHist(0), ignore_invalid_symbol = true)
+    d15 = request.security(dirId, "15", f_uHist(1), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+    int  hhO    = hour(time, TZ) * 100 + minute(time, TZ)
+    int  hhC    = hour(time_close, TZ) * 100 + minute(time_close, TZ)
+    bool newDay = dayofmonth(time, TZ) != dayofmonth(time[1], TZ)
+
+    // S4: regression on bar-to-bar changes; skip the overnight/holiday pair and post-15:15 bars (NSE/BSE)
+    float dp = close - close[1]
+    float du = uc - uc[1]
+    bool pairOK = not newDay and not na(dp) and not na(du) and (isMCX or hhO < CUT_SIG)
+    var array<float> ax = array.new<float>()
+    var array<float> ay = array.new<float>()
+    if pairOK
+        array.push(ax, du)
+        array.push(ay, dp)
+        if array.size(ax) > REG_BARS
+            array.shift(ax)
+            array.shift(ay)
+    int n = array.size(ax)
+    float sx  = 0.0
+    float sy  = 0.0
+    float sxx = 0.0
+    float sxy = 0.0
+    float syy = 0.0
+    if n > 1
+        for i = 0 to n - 1
+            float xv = array.get(ax, i)
+            float yv = array.get(ay, i)
+            sx  += xv
+            sy  += yv
+            sxx += xv * xv
+            sxy += xv * yv
+            syy += yv * yv
+    float vx     = n * sxx - sx * sx
+    float vy     = n * syy - sy * sy
+    float cxy    = n * sxy - sx * sy
+    float slope  = n > 1 and vx > 0 ? cxy / vx : na
+    float r2     = n > 1 and vx > 0 and vy > 0 ? (cxy * cxy) / (vx * vy) : na
+    float icpt   = not na(slope) ? (sy - slope * sx) / n : na          // premium change NOT explained by underlying
+    float sdy    = n > 1 and vy > 0 ? math.sqrt(vy) / n : na           // contract's own variability (sd of Δpremium)
+    float driftN = not na(icpt) and not na(sdy) and sdy > 0 ? icpt / sdy : na
+    bool  full   = n >= REG_BARS                                        // S8 warm-up
+    float dEff   = na(slope) ? na : isCall ? slope : -slope
+    bool deltaOK = not na(dEff) and dEff >= DELTA_LO and dEff <= DELTA_HI   // S5 band
+    bool fitOK   = not na(r2) and r2 >= FIT_MIN
+    bool drBOK   = not na(driftN) and math.max(0, -driftN) <= DRIFT_MAX     // decay hurts buyers
+    bool drSOK   = not na(driftN) and math.max(0, driftN) <= DRIFT_MAX      // rise hurts sellers
+
+    // S1: momentum persistence
+    var int runUp = 0
+    var int runDn = 0
+    runUp := m > s ? runUp + 1 : 0
+    runDn := m < s ? runDn + 1 : 0
+    int  needB = PERSIST_B + (isMCX ? PERSIST_MCX : 0)
+    int  needS = PERSIST_S + (isMCX ? PERSIST_MCX : 0)
+    bool mUp   = m > s
+    bool mDn   = m < s
+    bool momB  = runUp >= needB
+    bool momS  = runDn >= needS
+    bool rUp   = r > ra
+    bool rDn   = r < ra
+    float vwPrev = vw[1]
+    bool vwB   = close > vwPrev                        // S3: buyer only, offset VWMA
+    bool undB  = isCall ? d10 > 0 : d10 < 0           // buyer: engine-TF direction check
+    bool undS  = isCall ? d15 < 0 : d15 > 0           // seller: slower (15m) direction check [P]
+    bool cutOK = isMCX or hhC <= CUT_SIG               // S6
+
+    // S9: exhaustion latch, reset each session
+    var bool exB = false
+    var bool exS = false
+    if newDay
+        exB := false
+        exS := false
+    if r >= EXH_B_ON
+        exB := true
+    else if exB and r <= EXH_B_OFF
+        exB := false
+    if r <= EXH_S_ON
+        exS := true
+    else if exS and r >= EXH_S_OFF
+        exS := false
+
+    // S2: one signal per momentum run + cooldown; caps per session
+    var bool latB  = false
+    var bool latS  = false
+    var int  lastB = na
+    var int  lastS = na
+    var int  cntB  = 0
+    var int  cntS  = 0
+    if newDay
+        latB := false
+        latS := false
+        cntB := 0
+        cntS := 0
+    if runUp == 0
+        latB := false
+    if runDn == 0
+        latS := false
+    bool coolB = na(lastB) or bar_index - lastB >= COOLDOWN
+    bool coolS = na(lastS) or bar_index - lastS >= COOLDOWN
+    bool gatesB = deltaOK and fitOK and drBOK
+    bool gatesS = deltaOK and fitOK and drSOK
+    bool sigB = isOption and full and momB and rUp and vwB and undB and gatesB and not exB and not latB and coolB and cntB < MAX_BUYS and cutOK
+    bool sigS = isOption and full and momS and rDn and undS and gatesS and not exS and not latS and coolS and cntS < MAX_SELLS and cutOK and close >= minPrem
+    if sigB
+        latB  := true
+        lastB := bar_index
+        cntB  += 1
+    if sigS
+        latS  := true
+        lastS := bar_index
+        cntS  += 1
+
+    // Blocked-by counts for the selected mode (diagnostic only)
+    var array<int> bc = array.new<int>(11, 0)
+    bool setup = isOption and full and (isBuyer ? (momB and rUp) : (momS and rDn))
+    if setup
+        array.set(bc, 0, array.get(bc, 0) + 1)
+        if not (isBuyer ? undB : undS)
+            array.set(bc, 1, array.get(bc, 1) + 1)
+        if not deltaOK
+            array.set(bc, 2, array.get(bc, 2) + 1)
+        if not fitOK
+            array.set(bc, 3, array.get(bc, 3) + 1)
+        if not (isBuyer ? drBOK : drSOK)
+            array.set(bc, 4, array.get(bc, 4) + 1)
+        if (isBuyer ? exB : exS)
+            array.set(bc, 5, array.get(bc, 5) + 1)
+        if isBuyer ? (not coolB or (latB and not sigB)) : (not coolS or (latS and not sigS))
+            array.set(bc, 6, array.get(bc, 6) + 1)
+        if (isBuyer ? cntB >= MAX_BUYS and not sigB : cntS >= MAX_SELLS and not sigS)
+            array.set(bc, 7, array.get(bc, 7) + 1)
+        if not cutOK
+            array.set(bc, 8, array.get(bc, 8) + 1)
+        if isBuyer ? not vwB : close < minPrem
+            array.set(bc, 9, array.get(bc, 9) + 1)
+    if (isBuyer ? sigB : sigS)
+        array.set(bc, 10, array.get(bc, 10) + 1)
+    int b0  = array.get(bc, 0)
+    int b1  = array.get(bc, 1)
+    int b2  = array.get(bc, 2)
+    int b3  = array.get(bc, 3)
+    int b4  = array.get(bc, 4)
+    int b5  = array.get(bc, 5)
+    int b6  = array.get(bc, 6)
+    int b7  = array.get(bc, 7)
+    int b8  = array.get(bc, 8)
+    int b9  = array.get(bc, 9)
+    int b10 = array.get(bc, 10)
+    float cl  = close
+    int   tcl = time_close
+    [sigB[o], sigS[o], cl[o], tcl[o], cntB[o], cntS[o], mUp[o], mDn[o], rUp[o], r[o], ra[o], vwPrev[o], runUp[o], runDn[o], d10[o], d15[o], dEff[o], r2[o], driftN[o], deltaOK[o], fitOK[o], drBOK[o], drSOK[o], exB[o], exS[o], latB[o], latS[o], full[o], n[o], coolB[o], coolS[o], b0[o], b1[o], b2[o], b3[o], b4[o], b5[o], b6[o], b7[o], b8[o], b9[o], b10[o]]
+
+// 5m / 10m charts: request.security. 10m → same bar, gated to bar close. 5m → previous COMPLETED 10m bar.
+int offSec = is10 ? 0 : 1
+[sSigB, sSigS, sC, sTC, sCntB, sCntS, sMUp, sMDn, sRUp, sR, sRA, sVW, sRunUp, sRunDn, sD10, sD15, sDelta, sR2, sDrift, sDOK, sFOK, sDrB, sDrS, sExB, sExS, sLatB, sLatS, sFull, sN, sCoolB, sCoolS, sB0, sB1, sB2, sB3, sB4, sB5, sB6, sB7, sB8, sB9, sB10] = request.security(syminfo.tickerid, ENGINE_TF, f_engine(offSec), lookahead = is10 ? barmerge.lookahead_off : barmerge.lookahead_on)
+
+// 15m charts (S15): 10m intrabars, each reporting the PREVIOUS completed 10m bar → no lookahead; shown at 15m close.
+ltfTF = is15 ? ENGINE_TF : timeframe.period
+[aSigB, aSigS, aC, aTC, aCntB, aCntS, aMUp, aMDn, aRUp, aR, aRA, aVW, aRunUp, aRunDn, aD10, aD15, aDelta, aR2, aDrift, aDOK, aFOK, aDrB, aDrS, aExB, aExS, aLatB, aLatS, aFull, aN, aCoolB, aCoolS, aB0, aB1, aB2, aB3, aB4, aB5, aB6, aB7, aB8, aB9, aB10] = request.security_lower_tf(syminfo.tickerid, ltfTF, f_engine(1))
+
+f_lastF(array<float> a) =>
+    array.size(a) > 0 ? array.get(a, array.size(a) - 1) : na
+f_lastB(array<bool> a) =>
+    array.size(a) > 0 ? array.get(a, array.size(a) - 1) : false
+f_lastI(array<int> a) =>
+    array.size(a) > 0 ? array.get(a, array.size(a) - 1) : na
+f_idxTrue(array<bool> a) =>
+    int idx = -1
+    if array.size(a) > 0
+        for i = 0 to array.size(a) - 1
+            if array.get(a, i)
+                idx := i
+    idx
+
+// Engine view at chart level (latest completed engine bar)
+eC     = is15 ? f_lastF(aC)     : sC
+eTC    = is15 ? f_lastI(aTC)    : sTC
+eCntB  = is15 ? f_lastI(aCntB)  : sCntB
+eCntS  = is15 ? f_lastI(aCntS)  : sCntS
+eMUp   = is15 ? f_lastB(aMUp)   : sMUp
+eMDn   = is15 ? f_lastB(aMDn)   : sMDn
+eRUp   = is15 ? f_lastB(aRUp)   : sRUp
+eR     = is15 ? f_lastF(aR)     : sR
+eRA    = is15 ? f_lastF(aRA)    : sRA
+eVW    = is15 ? f_lastF(aVW)    : sVW
+eRunUp = is15 ? f_lastI(aRunUp) : sRunUp
+eRunDn = is15 ? f_lastI(aRunDn) : sRunDn
+eD10   = is15 ? f_lastF(aD10)   : sD10
+eD15   = is15 ? f_lastF(aD15)   : sD15
+eDelta = is15 ? f_lastF(aDelta) : sDelta
+eR2    = is15 ? f_lastF(aR2)    : sR2
+eDrift = is15 ? f_lastF(aDrift) : sDrift
+eDOK   = is15 ? f_lastB(aDOK)   : sDOK
+eFOK   = is15 ? f_lastB(aFOK)   : sFOK
+eDrB   = is15 ? f_lastB(aDrB)   : sDrB
+eDrS   = is15 ? f_lastB(aDrS)   : sDrS
+eExB   = is15 ? f_lastB(aExB)   : sExB
+eExS   = is15 ? f_lastB(aExS)   : sExS
+eLatB  = is15 ? f_lastB(aLatB)  : sLatB
+eLatS  = is15 ? f_lastB(aLatS)  : sLatS
+eFull  = is15 ? f_lastB(aFull)  : sFull
+eN     = is15 ? f_lastI(aN)     : sN
+eCoolB = is15 ? f_lastB(aCoolB) : sCoolB
+eCoolS = is15 ? f_lastB(aCoolS) : sCoolS
+eB0    = is15 ? f_lastI(aB0)    : sB0
+eB1    = is15 ? f_lastI(aB1)    : sB1
+eB2    = is15 ? f_lastI(aB2)    : sB2
+eB3    = is15 ? f_lastI(aB3)    : sB3
+eB4    = is15 ? f_lastI(aB4)    : sB4
+eB5    = is15 ? f_lastI(aB5)    : sB5
+eB6    = is15 ? f_lastI(aB6)    : sB6
+eB7    = is15 ? f_lastI(aB7)    : sB7
+eB8    = is15 ? f_lastI(aB8)    : sB8
+eB9    = is15 ? f_lastI(aB9)    : sB9
+eB10   = is15 ? f_lastI(aB10)   : sB10
+
+// Context requests (chart timeframe)
+spotNow  = request.security(uId, timeframe.period, close, ignore_invalid_symbol = true)
+spotPrev = request.security(uId, "D", close[1], lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+vixNow   = request.security("NSE:INDIAVIX", timeframe.period, close, ignore_invalid_symbol = true)
+vixPrev  = request.security("NSE:INDIAVIX", "D", close[1], lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+f_trend(int o) =>
+    [m, s, h] = ta.macd(close, MACD_F, MACD_S, MACD_SIG)
+    r  = ta.rsi(close, RSI_LEN)
+    ra = ta.sma(r, RSI_AVG)
+    [h[o], r[o], ra[o]]
+[t30H, t30R, t30RA] = request.security(uId, "30", f_trend(1), lookahead = barmerge.lookahead_on, ignore_invalid_symbol = true)
+
+uMissing = isOption and na(spotNow)
+engOn    = isOption and tfOK
+
+// ───────────────────────── Signal events at chart level ─────────────────────────
+int iB15 = is15 ? f_idxTrue(aSigB) : -1
+int iS15 = is15 ? f_idxTrue(aSigS) : -1
+bool newEng = is10 or is15 ? true : sTC != sTC[1]
+bool conf   = is5 ? true : barstate.isconfirmed
+bool evB = engOn and conf and (is15 ? iB15 >= 0 : newEng and sSigB)
+bool evS = engOn and conf and (is15 ? iS15 >= 0 : newEng and sSigS)
+float pB = is15 ? (iB15 >= 0 ? array.get(aC, iB15) : na) : sC
+float pS = is15 ? (iS15 >= 0 ? array.get(aC, iS15) : na) : sC
+int   tB = is15 ? (iB15 >= 0 ? array.get(aTC, iB15) : na) : sTC
+int   tS = is15 ? (iS15 >= 0 ? array.get(aTC, iS15) : na) : sTC
+int   nB = is15 ? (iB15 >= 0 ? array.get(aCntB, iB15) : na) : sCntB
+int   nS = is15 ? (iS15 >= 0 ? array.get(aCntS, iS15) : na) : sCntS
+
+showBuySig  = evB and isBuyer
+showSellSig = evS and not isBuyer
+
+// ───────────────────────── Visual helpers ─────────────────────────
+sz = switch txtSizeIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    =>          size.small
+
+bgLum  = 0.299 * color.r(chart.bg_color) + 0.587 * color.g(chart.bg_color) + 0.114 * color.b(chart.bg_color)
+isDark = themeIn == "Dark" or (themeIn == "Auto" and bgLum < 128)
+
+f_above(string pref, bool isBuy) =>
+    pref == "Above Bar" ? true : pref == "Below Bar" ? false : not isBuy
+f_ord(int n) =>
+    n == 2 ? "2nd" : n == 3 ? "3rd" : str.tostring(n) + "th"
+f_fmt(float v) =>
+    str.tostring(v, v < 20 ? "#.#" : "#")
+f_level(array<line> ls, array<label> lbs, float y, string tag, color c, int x1, int x2, string tsz) =>
+    array.push(ls, line.new(x1, y, x2, y, color = c, width = 1))
+    array.push(lbs, label.new(x2, y, f_fmt(y) + " " + tag, style = label.style_label_left, color = c, textcolor = color.white, size = tsz))
+
+LINE_BARS = math.max(1, math.round(LEVEL_MIN / tfMin))   // S11: 150 minutes
+newChartDay = timeframe.change("D")
+var int sessIdx = 0
+if newChartDay
+    sessIdx += 1
+
+// ───────────────────────── Chart drawing ─────────────────────────
+var array<line>  lvlLines  = array.new<line>()
+var array<label> lvlLabels = array.new<label>()
+var line  slLn   = na
+var label slLb   = na
+var label repTag = na
+var int   repSess = na
+var int pendingEntry = 0
+var float trP    = na
+var float trT1   = na
+var int   trDir  = 0
+var int   trEnd  = na
+var bool  trDone = true
+
+f_clearLevels(array<line> ls, array<label> lbs) =>
+    for l in ls
+        line.delete(l)
+    for lb in lbs
+        label.delete(lb)
+    array.clear(ls)
+    array.clear(lbs)
+
+if newChartDay      // S11: levels clear at the start of each day
+    f_clearLevels(lvlLines, lvlLabels)
+    line.delete(slLn)
+    label.delete(slLb)
+    trDone := true
+if not na(repTag) and sessIdx - repSess >= 2   // S12: tag clears after two trading sessions
+    label.delete(repTag)
+    repTag := na
+
+if pendingEntry != 0
+    bool eab = f_above(entPillIn, pendingEntry == 1)
+    label.new(bar_index, eab ? high : low, "Entry", yloc = eab ? yloc.abovebar : yloc.belowbar, style = eab ? label.style_label_down : label.style_label_up, color = C_ENTRY, textcolor = color.white, size = sz)
+    pendingEntry := 0
+
+// S13 trail reminder (visual only)
+if trailOn and not trDone and bar_index <= trEnd
+    bool hitT1 = trDir == 1 ? high >= trT1 : low <= trT1
+    if hitT1
+        line.set_y1(slLn, trP)
+        line.set_y2(slLn, trP)
+        line.set_color(slLn, C_TEAL)
+        line.set_style(slLn, line.style_dashed)
+        label.set_y(slLb, trP)
+        label.set_text(slLb, f_fmt(trP) + " SL · review")
+        label.set_color(slLb, C_TEAL)
+        label.new(bar_index, trDir == 1 ? low : high, "Trail: review your stop", yloc = trDir == 1 ? yloc.belowbar : yloc.abovebar, style = trDir == 1 ? label.style_label_up : label.style_label_down, color = C_TEAL, textcolor = color.white, size = size.tiny)
+        trDone := true
+
+// ── I1 outcome tracking (beyond original) ──
+var bool  tOpen  = false
+var int   tDir   = 0
+var float tP     = na
+var float tSL    = na
+var float tT1    = na
+var float tT2    = na
+var float tT3    = na
+var float tT4    = na
+var int   tHit   = 0
+var int   tStart = na
+var array<int> stHit = array.new<int>(5, 0)
+var int   stN    = 0
+var int   stC    = 0
+var int   stSL1  = 0
+var int   stSLx  = 0
+var int   stTime = 0
+var int   stRep  = 0
+var float stPnl  = 0.0
+var array<float> stRes = array.new<float>()   // gross result % from signal premium (as v0.8)
+var array<float> stNet = array.new<float>()   // net result % from actual entry after costs
+var float stCostP = 0.0                        // sum of cost as % of entry
+var float tE     = na                          // actual entry price
+var bool  tPend  = false                       // waiting for the entry bar
+barHHMM = hour(time, TZ) * 100 + minute(time, TZ)
+
+if trackOn and tOpen and bar_index > tStart
+    bool  isBt  = tDir == 1
+    if tPend
+        tE    := entryOn ? open : tP
+        tPend := false
+    float tExit = na
+    string tWhy = ""
+    bool slHit = isBt ? low <= tSL : high >= tSL
+    if slHit
+        tExit := isBt ? math.min(tSL, open) : math.max(tSL, open)   // gap through SL fills at the open
+        tWhy  := "SL"
+    else
+        float fav = isBt ? high : low
+        int nh = tHit
+        if (isBt ? fav >= tT1 : fav <= tT1)
+            nh := math.max(nh, 1)
+        if (isBt ? fav >= tT2 : fav <= tT2)
+            nh := math.max(nh, 2)
+        if (isBt ? fav >= tT3 : fav <= tT3)
+            nh := math.max(nh, 3)
+        if (isBt ? fav >= tT4 : fav <= tT4)
+            nh := math.max(nh, 4)
+        if nh > tHit
+            for k = tHit + 1 to nh
+                array.set(stHit, k, array.get(stHit, k) + 1)
+            label.new(bar_index, isBt ? high : low, "T" + str.tostring(nh) + " ✓", yloc = isBt ? yloc.abovebar : yloc.belowbar, style = isBt ? label.style_label_down : label.style_label_up, color = color.new(C_TGT, 15), textcolor = color.white, size = size.tiny)
+            tHit := nh
+        if tHit == 4
+            tExit := isBt ? math.max(tT4, open) : math.min(tT4, open)
+            tWhy  := "T4"
+        else if barHHMM >= EXIT_HHMM or newChartDay
+            tExit := close
+            tWhy  := "TIME"
+    if not na(tExit)
+        float pnl = isBt ? (tExit - tP) / tP * 100 : (tP - tExit) / tP * 100
+        stPnl += pnl
+        stC   += 1
+        array.push(stRes, pnl)
+        float eRef  = na(tE) ? tP : tE
+        float cst   = f_cost(eRef, tExit)
+        float netP  = ((isBt ? tExit - eRef : eRef - tExit) - cst) / eRef * 100
+        array.push(stNet, netP)
+        stCostP += cst / eRef * 100
+        if tWhy == "SL"
+            if tHit == 0
+                stSL1 += 1
+            else
+                stSLx += 1
+            label.new(bar_index, isBt ? low : high, "SL ✗", yloc = isBt ? yloc.belowbar : yloc.abovebar, style = isBt ? label.style_label_up : label.style_label_down, color = color.new(C_WARN, 15), textcolor = color.white, size = size.tiny)
+        if tWhy == "TIME"
+            stTime += 1
+            label.new(bar_index, isBt ? high : low, "15:15 exit " + (netP >= 0 ? "+" : "") + str.tostring(netP, "#") + "% net", yloc = isBt ? yloc.abovebar : yloc.belowbar, style = isBt ? label.style_label_down : label.style_label_up, color = color.new(C_NEU, 15), textcolor = color.white, size = size.tiny)
+        tOpen := false
+
+if showBuySig or showSellSig
+    bool  isB = showBuySig
+    int   n   = isB ? nB : nS
+    float P   = isB ? pB : pS                 // premium at signal = engine bar close [C]
+    int   tSig = isB ? tB : tS
+    bool  ab  = f_above(sigPillIn, isB)
+    label.new(bar_index, ab ? high : low, str.format_time(tSig, "hh:mm a", TZ) + "\n" + (isB ? "Buy Signal" : "Sell Signal"), yloc = ab ? yloc.abovebar : yloc.belowbar, style = ab ? label.style_label_down : label.style_label_up, color = C_SIG, textcolor = color.white, size = sz)
+    if n >= 2      // S12: only the most recent repeat tag is shown
+        label.delete(repTag)
+        repTag  := label.new(bar_index, ab ? low : high, f_ord(n) + " Signal - Be Cautious", yloc = ab ? yloc.belowbar : yloc.abovebar, style = ab ? label.style_label_up : label.style_label_down, color = C_WARN, textcolor = color.white, size = sz)
+        repSess := sessIdx
+    f_clearLevels(lvlLines, lvlLabels)
+    line.delete(slLn)
+    label.delete(slLb)
+    int x2 = bar_index + LINE_BARS
+    float slv = isB ? P * (1 - slPct / 100) : P * (1 + slPct / 100)
+    if showSL
+        slLn := line.new(bar_index, slv, x2, slv, color = C_WARN, width = 1)
+        slLb := label.new(x2, slv, f_fmt(slv) + " SL", style = label.style_label_left, color = C_WARN, textcolor = color.white, size = sz)
+    if showTgt
+        f_level(lvlLines, lvlLabels, P * (isB ? B_T1 : S_T1), "T1", C_TGT, bar_index, x2, sz)
+        f_level(lvlLines, lvlLabels, P * (isB ? B_T2 : S_T2), "T2", C_TGT, bar_index, x2, sz)
+        f_level(lvlLines, lvlLabels, P * (isB ? B_T3 : S_T3), "T3", C_TGT, bar_index, x2, sz)
+        f_level(lvlLines, lvlLabels, P * (isB ? B_T4 : S_T4), "T4", C_TGT, bar_index, x2, sz)
+    pendingEntry := isB ? 1 : -1
+    trP    := P
+    trT1   := P * (isB ? B_T1 : S_T1)
+    trDir  := isB ? 1 : -1
+    trEnd  := x2
+    trDone := not showSL
+    if trackOn
+        if tOpen
+            float pnlR = tDir == 1 ? (close - tP) / tP * 100 : (tP - close) / tP * 100
+            stPnl += pnlR
+            stC   += 1
+            array.push(stRes, pnlR)
+            float eRefR = na(tE) ? tP : tE
+            float cstR  = f_cost(eRefR, close)
+            array.push(stNet, ((tDir == 1 ? close - eRefR : eRefR - close) - cstR) / eRefR * 100)
+            stCostP += cstR / eRefR * 100
+            stRep += 1
+        tOpen  := true
+        tDir   := isB ? 1 : -1
+        tP     := P
+        tSL    := slv
+        tT1    := P * (isB ? B_T1 : S_T1)
+        tT2    := P * (isB ? B_T2 : S_T2)
+        tT3    := P * (isB ? B_T3 : S_T3)
+        tT4    := P * (isB ? B_T4 : S_T4)
+        tHit   := 0
+        tStart := bar_index
+        tE     := na
+        tPend  := true
+        stN    += 1
+
+barcolor(showBuySig or showSellSig ? C_SIG : na)
+
+// Shading: light = momentum (MACD) or RSI alone, stronger = both [C]
+color bgBuy  = eMUp and eRUp ? color.new(C_UP, 84) : (eMUp or eRUp) ? color.new(C_UP, 94) : na
+color bgSell = eMDn and not eRUp ? color.new(C_DN, 84) : (eMDn or not eRUp) ? color.new(C_DN, 94) : na
+bgcolor(engOn and not uMissing ? (isBuyer ? bgBuy : bgSell) : na)
+
+// ───────────────────────── Alerts (S14: seven "Alert Data:" plots; both conditions regardless of Mode) ─────────────────────────
+bool  alB  = evB
+float alP  = alB ? pB : evS ? pS : na
+float alSL = alB ? pB * (1 - slPct / 100) : evS ? pS * (1 + slPct / 100) : na
+float alT1 = alB ? pB * B_T1 : evS ? pS * S_T1 : na
+float alT2 = alB ? pB * B_T2 : evS ? pS * S_T2 : na
+float alT3 = alB ? pB * B_T3 : evS ? pS * S_T3 : na
+float alT4 = alB ? pB * B_T4 : evS ? pS * S_T4 : na
+float alTm = alB ? tB : evS ? tS : na
+plot(alP,  "Alert Data: Premium", display = display.none)
+plot(alSL, "Alert Data: SL",      display = display.none)
+plot(alT1, "Alert Data: T1",      display = display.none)
+plot(alT2, "Alert Data: T2",      display = display.none)
+plot(alT3, "Alert Data: T3",      display = display.none)
+plot(alT4, "Alert Data: T4",      display = display.none)
+plot(alTm, "Alert Data: Time",    display = display.none)
+alertcondition(evB, "Buy Signal", 'NC BUY {{ticker}} | Premium {{plot("Alert Data: Premium")}} | SL {{plot("Alert Data: SL")}} | T1 {{plot("Alert Data: T1")}} | T2 {{plot("Alert Data: T2")}} | T3 {{plot("Alert Data: T3")}} | T4 {{plot("Alert Data: T4")}} | {{time}}')
+alertcondition(evS, "Sell Signal", 'NC SELL {{ticker}} | Premium {{plot("Alert Data: Premium")}} | SL {{plot("Alert Data: SL")}} | T1 {{plot("Alert Data: T1")}} | T2 {{plot("Alert Data: T2")}} | T3 {{plot("Alert Data: T3")}} | T4 {{plot("Alert Data: T4")}} | {{time}}')
+
+// Data Window inspection (hover any bar)
+bool dwOn = engOn
+plot(dwOn ? (isBuyer ? eRunUp : eRunDn) : na, "DW MACD persistence (bars)", display = display.data_window)
+plot(dwOn ? (eRUp ? 1 : 0) : na, "DW RSI above avg", display = display.data_window)
+plot(dwOn ? eDelta : na, "DW Est Delta", display = display.data_window)
+plot(dwOn ? eR2 : na, "DW Fit R2", display = display.data_window)
+plot(dwOn ? eDrift : na, "DW Drift (normalised, + = premium rising vs underlying)", display = display.data_window)
+plot(dwOn ? eD10 : na, "DW Direction 10m MACD hist", display = display.data_window)
+plot(dwOn ? eD15 : na, "DW Direction 15m MACD hist", display = display.data_window)
+plot(dwOn ? ((isBuyer ? eExB : eExS) ? 1 : 0) : na, "DW Exhaustion latched", display = display.data_window)
+plot(dwOn ? ((isBuyer ? eLatB : eLatS) ? 1 : 0) : na, "DW Run already signalled", display = display.data_window)
+
+// ───────────────────────── Analysis dashboard (S10) ─────────────────────────
+f_pos(string p) =>
+    switch p
+        "Top Left"     => position.top_left
+        "Bottom Right" => position.bottom_right
+        "Bottom Left"  => position.bottom_left
+        =>                position.top_right
+
+var table ana  = table.new(f_pos(anaPosIn), 3, 6, border_width = 1, border_color = color.new(color.gray, 70))
+var table diag = table.new(anaPosIn == "Bottom Right" ? position.bottom_left : position.bottom_right, 2, 19, border_width = 1, border_color = color.new(color.gray, 70))
+var table outT = table.new(anaPosIn == "Bottom Right" ? position.middle_right : position.bottom_left, 2, 13, border_width = 1, border_color = color.new(color.gray, 70))
+
+if barstate.isfirst
+    table.merge_cells(ana, 0, 0, 2, 0)
+    for r = 1 to 5
+        if r != 3
+            table.merge_cells(ana, 1, r, 2, r)
+
+f_arrow(float v) =>
+    v >= 0 ? "▲" : "▼"
+
+eDrOK   = isBuyer ? eDrB : eDrS
+qFails  = (eDOK ? 0 : 1) + (eFOK ? 0 : 1) + (eDrOK ? 0 : 1)
+strikeQ = not isOption ? "—" : not eFull ? "Warming Up" : qFails == 0 ? "Good" : qFails == 1 ? "Weak" : "Avoid"
+t30Bull = t30H > 0 and t30R > t30RA
+t30Bear = t30H < 0 and t30R < t30RA
+nowHH   = hour(timenow, TZ) * 100 + minute(timenow, TZ)
+sameDay = dayofmonth(timenow, TZ) == dayofmonth(time, TZ) and month(timenow, TZ) == month(time, TZ)
+zoneW   = isBuyer ? "Buying" : "Selling"
+bothHold = isBuyer ? (eMUp and eRUp) : (eMDn and not eRUp)
+oneHold  = isBuyer ? (eMUp or eRUp) : (eMDn or not eRUp)
+
+if barstate.islast and showAna
+    txtN = color.white
+    vixCh = vixPrev > 0 ? (vixNow - vixPrev) / vixPrev * 100 : na
+    spCh  = spotPrev > 0 ? (spotNow - spotPrev) / spotPrev * 100 : na
+    string st = ""
+    color  sc = C_NEU
+    if not isOption
+        st := "Analysis Only — No Signals"
+        sc := C_BLUE
+    else if not tfOK
+        st := "Chart Timeframe Not Supported"
+        sc := C_DN
+    else if uMissing
+        st := "Underlying Not Recognised"
+        sc := C_DN
+    else if not eFull
+        st := "Warming Up — No Signals Yet"
+        sc := C_BLUE
+    else if not isMCX and (not sameDay or nowHH >= CAS_END)
+        st := "Post - CAS — Avoid Entry"
+        sc := C_NEU
+    else if not isMCX and nowHH >= CUT_SIG
+        st := "CAS - Index Frozen (3:15 PM)"
+        sc := C_WARN
+    else if (isBuyer ? eLatB : eLatS)
+        st := "Signal Given — Wait for Next"
+        sc := C_TEAL
+    else if qFails > 0
+        st := "Try Another Strike"
+        sc := C_WARN
+    else if bothHold
+        st := "Trading in " + zoneW + " Zone"
+        sc := C_SIG
+    else if oneHold
+        st := "Entering " + zoneW + " Zone"
+        sc := C_SIG
+    else
+        st := "Not in " + zoneW + " Zone"
+        sc := C_NEU
+    table.cell(ana, 0, 0, "ANALYSIS - OPTION " + (isBuyer ? "BUYER" : "SELLER"), bgcolor = C_HDR, text_color = txtN, text_size = sz, text_halign = text.align_left)
+    table.cell(ana, 0, 1, "INDIA VIX", bgcolor = C_LBL, text_color = txtN, text_size = sz)
+    table.cell(ana, 1, 1, str.tostring(vixNow, "#.##") + "  " + f_arrow(vixCh) + " " + str.tostring(vixCh, "#.##") + "%", bgcolor = C_VIX, text_color = color.black, text_size = sz)
+    table.cell(ana, 0, 2, "SPOT", bgcolor = C_LBL, text_color = txtN, text_size = sz)
+    if uMissing
+        table.cell(ana, 1, 2, "Underlying not found: " + uId, bgcolor = C_NEU, text_color = txtN, text_size = sz)
+    else
+        table.cell(ana, 1, 2, uName + " " + str.tostring(spotNow, "#.##") + "  " + f_arrow(spCh) + " " + str.tostring(spCh, "#.##") + "%", bgcolor = spCh >= 0 ? C_UP : C_DN, text_color = txtN, text_size = sz)
+    table.cell(ana, 0, 3, "TREND", bgcolor = C_LBL, text_color = txtN, text_size = sz)
+    table.cell(ana, 1, 3, "30 min " + (t30Bull ? "▲ Bullish" : t30Bear ? "▼ Bearish" : "• Neutral"), bgcolor = t30Bull ? C_UP : t30Bear ? C_DN : C_NEU, text_color = txtN, text_size = sz)
+    table.cell(ana, 2, 3, "10 min " + (eD10 > 0 ? "▲" : "▼"), bgcolor = eD10 > 0 ? C_UP : C_DN, text_color = txtN, text_size = sz)
+    table.cell(ana, 0, 4, "Strike Quality", bgcolor = C_LBL, text_color = txtN, text_size = sz)
+    table.cell(ana, 1, 4, strikeQ, bgcolor = strikeQ == "Good" ? C_UP : strikeQ == "Weak" ? C_WARN : strikeQ == "Avoid" ? C_DN : C_NEU, text_color = txtN, text_size = sz)
+    table.cell(ana, 0, 5, "STATUS", bgcolor = C_LBL, text_color = txtN, text_size = sz)
+    table.cell(ana, 1, 5, st, bgcolor = sc, text_color = txtN, text_size = sz)
+
+// ───────────────────────── Engine diagnostics ─────────────────────────
+f_drow(table t, int r, string k, string v, bool ok, bool dark) =>
+    color bg = dark ? #1E222D : #F0F3FA
+    color tx = dark ? color.white : color.black
+    table.cell(t, 0, r, k, bgcolor = bg, text_color = tx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(t, 1, r, v, bgcolor = ok ? color.new(C_UP, 70) : color.new(C_DN, 70), text_color = tx, text_size = size.tiny, text_halign = text.align_left)
+
+if barstate.islast and showDiag
+    int needB = PERSIST_B + (isMCX ? PERSIST_MCX : 0)
+    int needS = PERSIST_S + (isMCX ? PERSIST_MCX : 0)
+    f_drow(diag, 0, "NC Option Signals v0.10", "author-aligned · numbers provisional", true, isDark)
+    f_drow(diag, 1, "Engine", is10 ? "10m native" : is5 ? "10m → 5m (on 10m close)" : is15 ? "10m → 15m (≤10 min late)" : "paused on this TF", tfOK, isDark)
+    f_drow(diag, 2, "Underlying · direction", isOption ? uId + " · " + dirId : "not an option", isOption and not uMissing, isDark)
+    f_drow(diag, 3, "Regression window", str.tostring(eN) + " / " + str.tostring(REG_BARS) + " pairs", eFull, isDark)
+    f_drow(diag, 4, "MACD persistence", isBuyer ? str.tostring(eRunUp) + " bars (need " + str.tostring(needB) + ")" : str.tostring(eRunDn) + " bars (need " + str.tostring(needS) + ")", isBuyer ? eRunUp >= needB : eRunDn >= needS, isDark)
+    f_drow(diag, 5, "RSI / 14-avg", str.tostring(eR, "#.0") + " / " + str.tostring(eRA, "#.0"), isBuyer ? eRUp : not eRUp, isDark)
+    f_drow(diag, 6, "Close / VWMA20[1] (buyer)", isBuyer ? str.tostring(eC, "#.##") + " / " + str.tostring(eVW, "#.##") : "n/a in Seller", isBuyer ? eC > eVW : true, isDark)
+    f_drow(diag, 7, "Direction 10m · 15m", str.tostring(eD10, "#.##") + " · " + str.tostring(eD15, "#.##"), isBuyer ? (isCall ? eD10 > 0 : eD10 < 0) : (isCall ? eD15 < 0 : eD15 > 0), isDark)
+    f_drow(diag, 8, "Est. Delta (band)", str.tostring(eDelta, "#.##") + " (" + str.tostring(DELTA_LO) + "–" + str.tostring(DELTA_HI) + ")", eDOK, isDark)
+    f_drow(diag, 9, "Underlying Fit R² (min)", str.tostring(eR2, "#.##") + " (" + str.tostring(FIT_MIN) + ")", eFOK, isDark)
+    f_drow(diag, 10, "Adverse Drift / max", str.tostring(isBuyer ? math.max(0, -eDrift) : math.max(0, eDrift), "#.##") + " / " + str.tostring(DRIFT_MAX), eDrOK, isDark)
+    f_drow(diag, 11, "Exhaustion latch", (isBuyer ? eExB : eExS) ? "SUSPENDED" : "ok", not (isBuyer ? eExB : eExS), isDark)
+    f_drow(diag, 12, "Run signalled · cooldown", ((isBuyer ? eLatB : eLatS) ? "yes" : "no") + " · " + ((isBuyer ? eCoolB : eCoolS) ? "ok" : "waiting"), not (isBuyer ? eLatB : eLatS) and (isBuyer ? eCoolB : eCoolS), isDark)
+    f_drow(diag, 13, "Signals today", "Buy " + str.tostring(eCntB) + "/" + str.tostring(MAX_BUYS) + " · Sell " + str.tostring(eCntS) + "/" + str.tostring(MAX_SELLS), true, isDark)
+    f_drow(diag, 14, "Min premium (sell)", str.tostring(minPrem), isBuyer or eC >= minPrem, isDark)
+    f_drow(diag, 15, "History: setups → signals", str.tostring(eB0) + " → " + str.tostring(eB10), eB10 > 0, isDark)
+    f_drow(diag, 16, "Blocked: dir · Δ · fit · drift", str.tostring(eB1) + " · " + str.tostring(eB2) + " · " + str.tostring(eB3) + " · " + str.tostring(eB4), true, isDark)
+    f_drow(diag, 17, "Blocked: exh · run/cool · cap", str.tostring(eB5) + " · " + str.tostring(eB6) + " · " + str.tostring(eB7), true, isDark)
+    f_drow(diag, 18, "Blocked: 15:15 · " + (isBuyer ? "VWMA" : "min prem"), str.tostring(eB8) + " · " + str.tostring(eB9), true, isDark)
+
+// ───────────────────────── I1 outcome stats (beyond original) ─────────────────────────
+f_pct(int a, int n) =>
+    n > 0 ? str.tostring(a * 100.0 / n, "#") + "%" : "–"
+
+if barstate.islast and trackOn
+    color obg = isDark ? #1E222D : #F0F3FA
+    color otx = isDark ? color.white : color.black
+    table.cell(outT, 0, 0, "OUTCOMES (" + (isBuyer ? "buys" : "sells") + ", not in NC)", bgcolor = C_HDR, text_color = color.white, text_size = size.tiny)
+    table.cell(outT, 1, 0, "", bgcolor = C_HDR, text_size = size.tiny)
+    table.cell(outT, 0, 1, "Signals / closed", bgcolor = obg, text_color = otx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(outT, 1, 1, str.tostring(stN) + " / " + str.tostring(stC) + (tOpen ? " (1 open)" : ""), bgcolor = obg, text_color = otx, text_size = size.tiny)
+    table.cell(outT, 0, 2, "Reached T1 · T2", bgcolor = obg, text_color = otx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(outT, 1, 2, f_pct(array.get(stHit, 1), stN) + " · " + f_pct(array.get(stHit, 2), stN), bgcolor = color.new(C_UP, 70), text_color = otx, text_size = size.tiny)
+    table.cell(outT, 0, 3, "Reached T3 · T4", bgcolor = obg, text_color = otx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(outT, 1, 3, f_pct(array.get(stHit, 3), stN) + " · " + f_pct(array.get(stHit, 4), stN), bgcolor = color.new(C_UP, 70), text_color = otx, text_size = size.tiny)
+    table.cell(outT, 0, 4, "SL before T1", bgcolor = obg, text_color = otx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(outT, 1, 4, f_pct(stSL1, stC), bgcolor = color.new(C_DN, 70), text_color = otx, text_size = size.tiny)
+    table.cell(outT, 0, 5, "SL after T1 · 15:15 exit", bgcolor = obg, text_color = otx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(outT, 1, 5, f_pct(stSLx, stC) + " · " + f_pct(stTime, stC), bgcolor = obg, text_color = otx, text_size = size.tiny)
+    table.cell(outT, 0, 6, "Replaced by next signal", bgcolor = obg, text_color = otx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(outT, 1, 6, str.tostring(stRep), bgcolor = obg, text_color = otx, text_size = size.tiny)
+    float avgP = stC > 0 ? stPnl / stC : na
+    table.cell(outT, 0, 7, "Avg (signal price, no costs)", bgcolor = obg, text_color = otx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(outT, 1, 7, na(avgP) ? "–" : (avgP >= 0 ? "+" : "") + str.tostring(avgP, "#.#") + "%", bgcolor = obg, text_color = otx, text_size = size.tiny)
+    int   nN    = array.size(stNet)
+    float avgN  = nN > 0 ? array.avg(stNet) : na
+    float medN  = nN > 0 ? array.median(stNet) : na
+    int   winN  = 0
+    if nN > 0
+        for v in stNet
+            if v > 0
+                winN += 1
+    float avgC = nN > 0 ? stCostP / nN : na
+    table.cell(outT, 0, 8, "NET " + (entryOn ? "(entry next open + costs)" : "(signal price + costs)"), bgcolor = C_HDR, text_color = color.white, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(outT, 1, 8, lotUsed > 0 ? "lot " + str.tostring(lotUsed) : "lot ? (set input)", bgcolor = C_HDR, text_color = color.white, text_size = size.tiny)
+    table.cell(outT, 0, 9, "Avg net result", bgcolor = obg, text_color = otx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(outT, 1, 9, na(avgN) ? "–" : (avgN >= 0 ? "+" : "") + str.tostring(avgN, "#.#") + "%", bgcolor = na(avgN) ? obg : avgN >= 0 ? color.new(C_UP, 60) : color.new(C_DN, 60), text_color = otx, text_size = size.tiny)
+    table.cell(outT, 0, 10, "Win rate (net > 0)", bgcolor = obg, text_color = otx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(outT, 1, 10, f_pct(winN, nN), bgcolor = nN > 0 and winN * 2 >= nN ? color.new(C_UP, 60) : nN > 0 ? color.new(C_DN, 60) : obg, text_color = otx, text_size = size.tiny)
+    table.cell(outT, 0, 11, "Median net result", bgcolor = obg, text_color = otx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(outT, 1, 11, na(medN) ? "–" : (medN >= 0 ? "+" : "") + str.tostring(medN, "#.#") + "%", bgcolor = na(medN) ? obg : medN >= 0 ? color.new(C_UP, 60) : color.new(C_DN, 60), text_color = otx, text_size = size.tiny)
+    table.cell(outT, 0, 12, "Avg cost per trade", bgcolor = obg, text_color = otx, text_size = size.tiny, text_halign = text.align_left)
+    table.cell(outT, 1, 12, na(avgC) ? "–" : str.tostring(avgC, "#.#") + "% of entry", bgcolor = obg, text_color = otx, text_size = size.tiny)
